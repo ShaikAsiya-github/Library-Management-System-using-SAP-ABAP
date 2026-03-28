@@ -1,0 +1,233 @@
+
+*Module  USER_COMMAND_0100  INPUT
+MODULE user_command_0100 INPUT.
+  CASE sy-ucomm.                                  "When User action is performed "BACK,BTN1,BTN2,BTN3,BTN4 are function codes for the push buttons
+    WHEN 'BACK'.
+      LEAVE TO SCREEN 0.                          "To the previous screen
+    WHEN 'BTN1'.
+      CALL TRANSACTION 'ZTC_STUDENT_MODIF'.       "To student report output screen(tcode)
+    WHEN 'BTN2'.
+      CALL TRANSACTION 'Z119_ROUTCODE'.           "tocde for routine report output screen
+    WHEN 'BTN3'.
+      CALL TRANSACTION 'Z119_LIBCODE'.            "To library report output screen(tcode)
+    WHEN 'BTN4'.
+      CALL SCREEN 200.                            "Calls screen 200
+    WHEN OTHERS.
+      CALL SCREEN 300.                            "Calls screen 300
+  ENDCASE.
+ENDMODULE.
+
+
+
+
+
+
+*Module  USER_COMMAND_0200  INPUT
+MODULE user_command_0200 INPUT.
+
+  DATA: lv_count TYPE i,                         "Declaring local variable to validate count
+        lv_dept  TYPE ztabu_lib-dept_code.       "Declaring local variable fo dept code
+
+  CASE sy-ucomm.
+    WHEN 'BACK'.                                 "Moves back to previous screen
+      LEAVE TO SCREEN 0.
+
+    WHEN 'ENTER'.                                "When we give book id and press enter we get book name
+      IF ztabu_lib-book_id IS NOT INITIAL.       "Load book related fields like name
+        SELECT SINGLE
+               book_name
+          FROM ztabu_lib
+          WHERE book_id = @ztabu_lib-book_id     "For initializing here at this area, as there is no global declartion
+          INTO @ztabu_lib-book_name.
+
+        IF sy-subrc <> 0.
+          MESSAGE TEXT-000 TYPE 'S' DISPLAY LIKE 'E'. "If no book found
+        ENDIF.
+      ENDIF.
+
+      CLEAR lv_dept.
+      IF ztabu_lib-issued_to IS NOT INITIAL.      " Fill Department ONLY when a Student/Teacher ID is entered
+        SELECT SINGLE dept_code                   " Try Student table first
+          FROM ztabu_student
+          WHERE student_id = @ztabu_lib-issued_to
+          INTO @lv_dept.
+
+        IF sy-subrc <> 0 OR lv_dept IS INITIAL.
+          SELECT SINGLE department                " If not a student, try Teacher table
+            FROM ztabu_teacher
+            WHERE teacher_id = @ztabu_lib-issued_to
+            INTO @lv_dept.                        "Storing student/ teacher id in lv_dept variable
+        ENDIF.
+
+        IF lv_dept IS NOT INITIAL.                "As after the student/ teacher id is found in database table(ztabu_lib and lv_deptcode is not null)
+          ztabu_lib-dept_code = lv_dept.
+        ELSE.
+          MESSAGE TEXT-001 TYPE 'S' DISPLAY LIKE 'E'."Department not found
+        ENDIF.
+
+      ENDIF.
+
+*we are assigning dates to book when issuing
+      IF ztabu_lib-book_id IS NOT INITIAL AND            "we are just checking that all fields are filled
+         ztabu_lib-book_name IS NOT INITIAL AND
+         ztabu_lib-dept_code IS NOT INITIAL AND
+         ztabu_lib-issued_to IS NOT INITIAL.
+
+        ztabu_lib-issued_on   = sy-datum.                 "Fetches current date from system
+        ztabu_lib-return_date = sy-datum + 21.            "Fetches forward 21 days from issued date
+
+      ENDIF.
+
+* When we click on issue book button
+    WHEN 'SAVE'.                                          "Save is a function code for save button
+
+      "Mandatory checks
+      IF ztabu_lib-book_id IS INITIAL.
+        MESSAGE TEXT-002 TYPE 'S' DISPLAY LIKE 'E'.       "If book id is not entered
+        EXIT.
+      ENDIF.
+
+      IF ztabu_lib-issued_to IS INITIAL.
+        MESSAGE TEXT-003 TYPE 'S' DISPLAY LIKE 'E'.        "If id of student/teacher is not entered
+        EXIT.
+      ENDIF.
+
+      IF lv_dept IS INITIAL.
+        MESSAGE TEXT-004 TYPE 'S' DISPLAY LIKE 'E'.        "If department code is not found
+        EXIT.
+      ENDIF.
+
+
+      " Availability check (allow re-issue if returned TODAY or cleared; block if due in FUTURE)
+      DATA: lv_exist_issued_to TYPE ztabu_lib-issued_to,
+            lv_exist_ret_date  TYPE ztabu_lib-return_date.
+
+      SELECT SINGLE issued_to, return_date
+        FROM ztabu_lib
+        WHERE book_id = @ztabu_lib-book_id
+        INTO (@lv_exist_issued_to, @lv_exist_ret_date).
+
+      " Block ONLY when the book is still out (return_date strictly > today AND issued_to still set)
+      IF sy-subrc = 0
+         AND lv_exist_issued_to IS NOT INITIAL
+         AND lv_exist_ret_date > sy-datum.
+        MESSAGE TEXT-006 TYPE 'S' DISPLAY LIKE 'E'.       "Already issued
+        CALL FUNCTION 'ENQUEUE_EZLIB119'                  "locking
+          EXPORTING
+            mode_ztabu_lib = 'S'                          "Read lock
+            mandt          = sy-mandt
+            book_id        = ztabu_lib-book_id
+          EXCEPTIONS
+            foreign_lock   = 1
+            system_failure = 2
+            OTHERS         = 3.
+
+        EXIT.
+      ENDIF.
+
+      " Borrower limit: max 2 concurrently held books (strictly future due) Validating
+      SELECT COUNT( * )
+        FROM ztabu_lib
+        WHERE issued_to   = @ztabu_lib-issued_to
+          AND return_date > @sy-datum
+        INTO @lv_count.
+
+      IF lv_count >= 2.
+        MESSAGE TEXT-007 TYPE 'S' DISPLAY LIKE 'E'.             "User already holds 2 books
+        EXIT.
+      ENDIF.
+
+      " Updating the row in the database table of ztabu_lib records.
+      UPDATE ztabu_lib
+         SET issued_to   = @ztabu_lib-issued_to,
+             issued_on   = @ztabu_lib-issued_on,
+             return_date = @ztabu_lib-return_date,
+             dept_code   = @ztabu_lib-dept_code
+       WHERE book_id     = @ztabu_lib-book_id.
+
+      IF sy-subrc = 0.
+        MESSAGE TEXT-008 TYPE 'S'.                              "Successful
+        COMMIT WORK AND WAIT.                                   " Save changes permanently
+      ELSE.
+        MESSAGE TEXT-009 TYPE 'S' DISPLAY LIKE 'E'.             "Not updated
+      ENDIF.
+
+
+  ENDCASE.
+
+ENDMODULE.
+
+
+
+*&      Module  USER_COMMAND_0300  INPUT
+MODULE user_command_0300 INPUT.
+  CASE sy-ucomm.
+
+    WHEN 'BACK'.
+      LEAVE TO SCREEN 0.                          "Navigates to previous screen
+
+    WHEN 'ENTER'.                                 "When we give book id student id/teacher id should come
+      IF ztabu_lib-book_id IS NOT INITIAL.
+        SELECT SINGLE issued_to
+          FROM ztabu_lib
+          WHERE book_id = @ztabu_lib-book_id
+          INTO @ztabu_lib-issued_to.
+
+        IF sy-subrc <> 0.
+          MESSAGE TEXT-000 TYPE 'S' DISPLAY LIKE 'E'.   "No Book Found
+        ENDIF.
+      ENDIF.
+
+    WHEN 'CTB'.  " Collect button
+      IF ztabu_lib-book_id IS INITIAL.    " Mandatory check
+        MESSAGE TEXT-010 TYPE 'S' DISPLAY LIKE 'E'.       "Enter book id to collect
+        EXIT.
+      ENDIF.
+
+      " Read current state
+      DATA: lv_cur_issued_to TYPE ztabu_lib-issued_to,
+            lv_cur_ret_date  TYPE ztabu_lib-return_date.
+
+      SELECT SINGLE issued_to, return_date
+        FROM ztabu_lib
+        WHERE book_id = @ztabu_lib-book_id
+        INTO (@lv_cur_issued_to, @lv_cur_ret_date).
+
+      IF lv_cur_issued_to is INITIAL.
+        MESSAGE TEXT-011 TYPE 'S' DISPLAY LIKE 'E'.      "Book is already collected successfully.
+
+      ELSEIF lv_cur_ret_date < sy-datum.                 "Condition to check due date, if its overdue then automatically unlocks the book so others can take that book
+        MESSAGE TEXT-011 TYPE 'S' DISPLAY LIKE 'E'.      "Book is already collected successfully.
+        CALL FUNCTION 'DEQUEUE_EZLIB119'
+          EXPORTING
+            book_id = ztabu_lib-book_id.
+        EXIT.
+
+      ELSE.
+*        IF sy-subrc = 0.
+          MESSAGE TEXT-012 TYPE 'S'.                       "Book is submitted sucessfully.
+          CALL FUNCTION 'DEQUEUE_EZLIB119'
+            EXPORTING
+              book_id = ztabu_lib-book_id.
+          COMMIT WORK AND WAIT. " Save changes permanently
+*        ENDIF.
+      ENDIF.
+
+*      IF sy-subrc = 0.
+*        MESSAGE TEXT-012 TYPE 'S'. "Book is submitted sucessfully.
+*        CALL FUNCTION 'DEQUEUE_EZLIB119' EXPORTING book_id = ztabu_lib-book_id.
+*        COMMIT WORK AND WAIT. " Save changes permanently
+*      ENDIF.
+* Updating the row in the database table (ztabu_lib records)
+      UPDATE ztabu_lib
+         SET return_date = @sy-datum,
+             issued_to   = '',
+             dept_code   = ''
+       WHERE book_id     = @ztabu_lib-book_id
+         AND issued_to   = @lv_cur_issued_to.
+
+
+
+  ENDCASE.
+
+ENDMODULE.
